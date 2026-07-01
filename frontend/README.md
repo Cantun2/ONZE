@@ -18,9 +18,12 @@ nothing is framed as a sure thing.
    odds.
 3. **Bracket** (`/bracket`) — per-team Monte-Carlo advancement odds
    (reach semi / final / champion). Updates when data refetches.
-4. **Calibration** (`/calibration`) — model-vs-baseline RPS / log-loss / Brier
-   from the backtest, plus the methodological-honesty caveat. Shows a friendly
-   "backtest pending" state when the eval endpoint returns 503.
+4. **Calibration** (`/calibration`) — the reliability curve (predicted vs
+   observed frequency per bin, with the y = x perfect-calibration diagonal;
+   points sized by sample count), the ECE headline, tuned ξ / window / match-count
+   context, and model-vs-baseline RPS / log-loss / Brier. Prefers the API's own
+   honesty caveat when present. Shows a friendly "backtest pending" state on 503,
+   and a "reliability curve pending" note if the report lacks calibration bins.
 
 ## Requirements
 
@@ -63,11 +66,12 @@ backend does **not** need to be running to build — fetches happen at runtime.
 
 ## Honesty notes for the coach
 
-- The `/eval/backtest` response (`BacktestOut` in `src/api/main.py`) currently
-  returns only per-model scores — no per-bin calibration data and no caveat
-  string. The reliability-curve slot is therefore reserved and flagged in-app;
-  expose calibration bins (`{p_pred, p_obs, n}`) from
-  `src/eval/calibration.py` to enable that chart. The honesty caveat shown is the
-  spec's own §3.7 text.
+- The `/eval/backtest` response (`BacktestOut` in `src/api/main.py`) now also
+  returns per-bin calibration data (`calibration: [{bin_lo, bin_hi, p_pred,
+  p_obs, n}]`), `ece`, `xi_chosen` / `xi_half_life_days`, `generated_from`,
+  `n_matches`, and a `caveat` string. All are treated as optional and
+  null-guarded: the reliability curve, ECE headline and context line render when
+  present, and fall back to a "reliability curve pending" note otherwise. The
+  honesty caveat prefers the API's `caveat`, falling back to the spec's §3.7 text.
 - `/bracket` returns per-team reach/champion probabilities, not a fixed tie tree,
   so progression is shown as columns rather than a drawn bracket.

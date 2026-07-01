@@ -72,10 +72,26 @@ export interface BacktestRow {
   n_matches: number | null;
 }
 
+export interface CalibrationBin {
+  bin_lo: number;
+  bin_hi: number;
+  p_pred: number;
+  p_obs: number;
+  n: number;
+}
+
 export interface Backtest {
   from_year: number | null;
   results: BacktestRow[];
   source: string;
+  // Extended fields (optional; may be null on older eval artifacts — guard for null).
+  calibration?: CalibrationBin[] | null;
+  ece?: number | null;
+  xi_chosen?: number | null;
+  xi_half_life_days?: number | null;
+  generated_from?: string | null;
+  n_matches?: number | null;
+  caveat?: string | null;
 }
 
 // Thrown for a 503 so views can render a friendly "pending" placeholder.
