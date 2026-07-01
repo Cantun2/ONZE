@@ -84,9 +84,11 @@ def base_pairs(con) -> list[tuple[int, int, dict]]:
     ``(date, fixture_id)``; ``venue_row`` carries ``neutral`` / ``host_flag`` for
     the effective home bonus. The number of pairings must be a power of two.
     """
+    # Order by fixture_id: it *is* the bracket slot. (Ordering by date would
+    # scramble adjacency when a round spans several days, e.g. the Round of 32.)
     fx = con.execute(
         "SELECT fixture_id, date, home_id, away_id, stage, neutral, host_flag "
-        "FROM fixtures ORDER BY date, fixture_id"
+        "FROM fixtures ORDER BY fixture_id"
     ).fetchdf()
     if fx.empty:
         raise ValueError("fixtures table is empty; nothing to simulate")
@@ -98,7 +100,7 @@ def base_pairs(con) -> list[tuple[int, int, dict]]:
         counts.groups,
         key=lambda s: (len(counts.groups[s]), -fx.loc[counts.groups[s], "date"].min().toordinal()),
     )
-    base = fx[fx["stage"] == base_stage].sort_values(["date", "fixture_id"])
+    base = fx[fx["stage"] == base_stage].sort_values("fixture_id")
 
     pairs = [
         (int(r.home_id), int(r.away_id),

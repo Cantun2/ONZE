@@ -1,32 +1,36 @@
-"""Seed the ``fixtures`` table with the real 2026 World Cup Round of 16.
+"""Seed the ``fixtures`` table with the real 2026 World Cup Round of 32.
 
-This replaces the earlier *illustrative* placeholder fixtures with the actual
-remaining knockout bracket as reported around 2026-07-01 (the tournament is
-mid-flow: the Round of 32 is finishing, the Round of 16 runs 4-7 July).
+This replaces the illustrative placeholder fixtures with the actual knockout
+bracket as reported around 2026-07-01. On the seed date the Round of 32 (French:
+*16es de finale*) is in progress: the upper half (June 28-30) is played, and the
+lower half runs 1-3 July. All 16 ties are seeded so the app shows every match
+and the Monte-Carlo sim runs the full tree Round-of-32 -> Round-of-16 ->
+quarter-final -> semi-final -> final.
 
 Data provenance (official / press bracket, cross-checked):
   - Wikipedia "2026 FIFA World Cup knockout stage"
   - ESPN / CBS Sports 2026 World Cup bracket pages
 
-Top half of the bracket is fully resolved by played Round-of-32 results:
+Played upper-half results (for reference; the model still shows its *pre-match*
+view of every tie, as the fixtures carry no result column):
     Canada 1-0 South Africa, Brazil 2-1 Japan, Paraguay 1-1 (4-3p) Germany,
-    Morocco 1-1 (3-2p) Netherlands, Norway 2-1 Ivory Coast, France 3-0 Sweden,
-    Mexico 2-0 Ecuador, England 2-1 DR Congo.
+    Morocco 1-1 (3-2p) Netherlands, Norway 2-1 Ivory Coast, France 3-0 Sweden.
+Lower half (1-3 July): Mexico-Ecuador, USA-Bosnia, Belgium-Senegal,
+England-DR Congo, Switzerland-Algeria, Portugal-Croatia, Spain-Austria,
+Argentina-Cape Verde, Australia-Egypt, Colombia-Ghana.
 
-Bottom half still has Round-of-32 ties in progress on the seed date, so the
-qualifier for those slots is **projected** as the higher current-Elo side
-(``teams.elo_current``). These are flagged ``projected=True`` below and printed
-in the seed report so the assumption is explicit and honest.
+Bracket order (``fixture_id``) IS the bracket slot. Consecutive ties feed the
+same next-round tie: winners of slots ``2j`` and ``2j+1`` meet in the Round of 16
+(so slots 0&1 -> Canada/SA winner vs Morocco/Netherlands winner = the "Canada vs
+Morocco" R16 tie, etc.), and this repeats up to the final. The Monte-Carlo sim
+(:mod:`src.predict.bracket`) reads the base round by ``fixture_id`` for exactly
+this reason. Note the dates span several days, so ordering must be by slot, not
+date.
 
-Venue/host handling (spec §3.1, §7.3): all 2026 matches are on neutral ground
-except when a host nation (USA / Canada / Mexico) plays at home, which keeps the
-home-field Elo bonus. Mexico play in Mexico City and the USA in Seattle here, so
-those two ties are non-neutral with ``host_flag=True`` and the host set as the
-home side; every other tie is ``neutral=True``.
-
-Bracket adjacency (used by the Monte-Carlo sim) follows the listed order:
-consecutive Round-of-16 fixtures feed the same quarter-final
-(R16[0] & R16[1] -> QF0, R16[2] & R16[3] -> QF1, ...). Documented assumption.
+Venue/host handling (spec §3.1, §7.3): all matches neutral except when a host
+nation (USA / Canada / Mexico) plays at home. Here Mexico (vs Ecuador) and the
+USA (vs Bosnia) play home ties and keep the Elo home bonus; Canada's tie is at a
+US venue, so it is neutral. Every other tie is neutral.
 """
 
 from __future__ import annotations
@@ -38,41 +42,44 @@ import duckdb
 from src.config import load_config
 from src.ingest.canonical import resolve
 
-# fixture_id, date, home team, away team, stage, neutral, host_flag, projected
-# `home` carries the home-field bonus only when neutral is False (host at home).
-_R16 = [
-    (0, "2026-07-04", "Morocco", "Canada", "Round of 16", True, False, False),
-    (1, "2026-07-04", "France", "Paraguay", "Round of 16", True, False, False),
-    (2, "2026-07-05", "Brazil", "Norway", "Round of 16", True, False, False),
-    (3, "2026-07-05", "Mexico", "England", "Round of 16", False, True, False),   # Mexico home, Mexico City
-    (4, "2026-07-06", "Spain", "Portugal", "Round of 16", True, False, True),    # Spain proj. over Austria; Portugal proj. over Croatia
-    (5, "2026-07-06", "United States", "Belgium", "Round of 16", False, True, True),  # USA home, Seattle; Belgium proj. over Senegal
-    (6, "2026-07-07", "Argentina", "Australia", "Round of 16", True, False, True),    # Australia proj. over Egypt
-    (7, "2026-07-07", "Switzerland", "Colombia", "Round of 16", True, False, True),   # Switzerland proj. over Algeria; Colombia proj. over Ghana
+# slot, date, home, away, stage, neutral, host_flag
+# Order is the bracket slot; adjacent pairs (0&1, 2&3, ...) feed one R16 tie.
+# `home` carries the home bonus only when neutral is False (host at home).
+_R32 = [
+    (0,  "2026-06-28", "Canada", "South Africa", True,  False),   # -> R16 slot A vs slot B
+    (1,  "2026-06-29", "Morocco", "Netherlands", True,  False),
+    (2,  "2026-06-29", "Paraguay", "Germany", True,  False),
+    (3,  "2026-06-30", "France", "Sweden", True,  False),
+    (4,  "2026-06-29", "Brazil", "Japan", True,  False),
+    (5,  "2026-06-30", "Norway", "Ivory Coast", True,  False),
+    (6,  "2026-07-01", "Mexico", "Ecuador", False, True),          # Mexico host, home
+    (7,  "2026-07-01", "England", "DR Congo", True,  False),
+    (8,  "2026-07-02", "Spain", "Austria", True,  False),
+    (9,  "2026-07-02", "Portugal", "Croatia", True,  False),
+    (10, "2026-07-01", "United States", "Bosnia and Herzegovina", False, True),  # USA host, home
+    (11, "2026-07-01", "Belgium", "Senegal", True,  False),
+    (12, "2026-07-03", "Argentina", "Cape Verde", True,  False),
+    (13, "2026-07-03", "Australia", "Egypt", True,  False),
+    (14, "2026-07-02", "Switzerland", "Algeria", True,  False),
+    (15, "2026-07-03", "Colombia", "Ghana", True,  False),
 ]
+
+_STAGE = "Round of 32"
 
 
 def seed_fixtures(con: duckdb.DuckDBPyConnection) -> list[tuple]:
-    """Replace all rows of ``fixtures`` with the real 2026 Round of 16.
+    """Replace all rows of ``fixtures`` with the real 2026 Round of 32.
 
     Returns the seeded rows as ``(fixture_id, date, home_id, away_id, stage,
     neutral, host_flag)`` tuples.
     """
     rows = []
-    for fid, date, home, away, stage, neutral, host_flag, _proj in _R16:
+    for fid, date, home, away, neutral, host_flag in _R32:
         home_id, away_id = resolve(home), resolve(away)
         if home_id is None or away_id is None:  # pragma: no cover - names are canonical
             raise ValueError(f"Unresolved team in fixture {fid}: {home!r} / {away!r}")
         rows.append(
-            (
-                fid,
-                _dt.date.fromisoformat(date),
-                home_id,
-                away_id,
-                stage,
-                neutral,
-                host_flag,
-            )
+            (fid, _dt.date.fromisoformat(date), home_id, away_id, _STAGE, neutral, host_flag)
         )
 
     con.execute("DELETE FROM fixtures")
@@ -90,21 +97,14 @@ def main() -> None:
     con = duckdb.connect(str(cfg.paths.db_path))
     try:
         rows = seed_fixtures(con)
-        names = {
-            r[0]: r[1]
-            for r in con.execute("SELECT team_id, name_canonical FROM teams").fetchall()
-        }
-        elos = {
-            r[0]: r[1]
-            for r in con.execute("SELECT team_id, elo_current FROM teams").fetchall()
-        }
-        print(f"[fixtures_2026] seeded {len(rows)} Round-of-16 fixtures:\n")
-        for (fid, date, hid, aid, stage, neutral, host), meta in zip(rows, _R16):
-            proj = "  (projected qualifier)" if meta[7] else ""
+        names = dict(con.execute("SELECT team_id, name_canonical FROM teams").fetchall())
+        elos = dict(con.execute("SELECT team_id, elo_current FROM teams").fetchall())
+        print(f"[fixtures_2026] seeded {len(rows)} Round-of-32 fixtures:\n")
+        for fid, date, hid, aid, stage, neutral, host in rows:
             venue = "neutral" if neutral else f"{names[hid]} HOME (host)"
             print(
-                f"  #{fid} {date}  {names[hid]:14} ({elos[hid]:.0f}) "
-                f"vs {names[aid]:14} ({elos[aid]:.0f})  [{venue}]{proj}"
+                f"  #{fid:2d} {date}  {names[hid]:14} ({elos[hid]:.0f}) "
+                f"vs {names[aid]:22} ({elos[aid]:.0f})  [{venue}]"
             )
     finally:
         con.close()

@@ -50,6 +50,8 @@ from src.ratings.elo import _home_bonus
 # every remaining World Cup match is knockout, but we key off the stage string so
 # a future league fixture (a plain 90' match) would simply skip the KO branch.
 _KO_STAGES = {
+    "round-of-32",
+    "round of 32",
     "round-of-16",
     "round of 16",
     "quarter-final",
