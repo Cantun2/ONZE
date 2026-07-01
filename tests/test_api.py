@@ -147,9 +147,27 @@ def test_backtest_endpoint_200_or_503():
         body = r.json()
         assert isinstance(body["results"], list) and len(body["results"]) > 0
         assert "source" in body
+        # optional calibration/ece pass-throughs must be present as keys (may be null)
+        for key in ("calibration", "ece", "xi_chosen", "xi_half_life_days",
+                    "caveat", "generated_from", "n_matches"):
+            assert key in body
     else:
         # must be a clean, informative 503 (not a crash / 500)
         assert "detail" in r.json()
+
+
+def test_backtest_calibration_passthrough():
+    """When the artifact carries a calibration curve + ece, pass them through."""
+    r = client.get("/eval/backtest?from=2020")
+    if r.status_code != 200:
+        pytest.skip("no eval report artifact available")
+    body = r.json()
+    cal = body["calibration"]
+    assert isinstance(cal, list) and len(cal) > 0
+    b0 = cal[0]
+    for key in ("bin_lo", "bin_hi", "p_pred", "p_obs", "n"):
+        assert key in b0
+    assert isinstance(body["ece"], float)
 
 
 @requires_db

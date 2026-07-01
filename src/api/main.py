@@ -77,6 +77,8 @@ class FixtureOut(BaseModel):
 
 
 class OverUnderLine(BaseModel):
+    """Over/Under probabilities for one goals line (spec §3.4)."""
+
     over: float
     under: float
 
@@ -131,6 +133,8 @@ class BracketTeamOut(BaseModel):
 
 
 class BracketOut(BaseModel):
+    """Bracket Monte-Carlo result: per-team probabilities + sim metadata (spec §5)."""
+
     n_sims: int
     seed: int
     teams: list[BracketTeamOut]
@@ -146,15 +150,46 @@ class BacktestRowOut(BaseModel):
     n_matches: Optional[int] = None
 
 
+class CalibrationBinOut(BaseModel):
+    """One reliability-diagram bin (spec §3.7): predicted vs observed frequency."""
+
+    bin_lo: float
+    bin_hi: float
+    p_pred: float = Field(..., description="Mean predicted probability in the bin.")
+    p_obs: float = Field(..., description="Observed frequency in the bin.")
+    n: int = Field(..., description="Number of predictions falling in the bin.")
+
+
 class BacktestOut(BaseModel):
-    """Model vs Elo (vs bookmaker) comparison from the eval report (spec §4.4)."""
+    """Model vs Elo (vs bookmaker) comparison from the eval report (spec §4.4).
+
+    The first three fields (``from_year``, ``results``, ``source``) are the stable
+    contract the frontend binds. The remaining fields are optional pass-throughs of
+    richer artifact content (calibration curve, ECE, chosen ``xi``, honesty caveat,
+    window metadata) so the frontend can draw the reliability diagram (spec §3.7,
+    §5 view 4). They default to ``None`` so an older artifact lacking them still
+    serialises cleanly.
+    """
 
     from_year: Optional[int] = None
     results: list[BacktestRowOut]
     source: str = Field(..., description="Where the report was read from.")
+    calibration: Optional[list[CalibrationBinOut]] = Field(
+        None, description="Reliability-diagram bins (spec §3.7), if present."
+    )
+    ece: Optional[float] = Field(None, description="Expected calibration error.")
+    xi_chosen: Optional[float] = Field(None, description="Time-decay rate chosen by backtest.")
+    xi_half_life_days: Optional[float] = Field(
+        None, description="Half-life (days) that ``xi_chosen`` encodes."
+    )
+    caveat: Optional[str] = Field(None, description="Honesty / sample-size note (spec §3.7).")
+    generated_from: Optional[str] = Field(None, description="Backtest window start.")
+    n_matches: Optional[int] = Field(None, description="Matches in the backtest window.")
 
 
 class RefreshOut(BaseModel):
+    """Result of ``POST /refresh``: recompute status + counts (spec §4.4)."""
+
     status: str
     predictions_written: int
     caches_cleared: bool
@@ -447,6 +482,52 @@ def _load_eval_report() -> Optional[dict[str, Any]]:
     return None
 
 
+def _as_float(v: Any) -> Optional[float]:
+    """Coerce ``v`` to float, or ``None`` if absent/non-numeric."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(v: Any) -> Optional[int]:
+    """Coerce ``v`` to int, or ``None`` if absent/non-numeric."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_calibration(raw: Any) -> Optional[list[CalibrationBinOut]]:
+    """Parse the calibration bins from the report, tolerating malformed entries.
+
+    Expects a list of ``{bin_lo, bin_hi, p_pred, p_obs, n}`` dicts (spec §3.7).
+    Returns ``None`` when absent; skips any bin missing required numeric fields so
+    a partially-malformed artifact still yields a usable curve.
+    """
+    if not isinstance(raw, list) or not raw:
+        return None
+    bins: list[CalibrationBinOut] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        lo = _as_float(item.get("bin_lo"))
+        hi = _as_float(item.get("bin_hi"))
+        p_pred = _as_float(item.get("p_pred"))
+        p_obs = _as_float(item.get("p_obs"))
+        n = _as_int(item.get("n"))
+        if None in (lo, hi, p_pred, p_obs, n):
+            continue
+        bins.append(
+            CalibrationBinOut(bin_lo=lo, bin_hi=hi, p_pred=p_pred, p_obs=p_obs, n=n)
+        )
+    return bins or None
+
+
 def _normalise_backtest_report(report: dict[str, Any]) -> list[BacktestRowOut]:
     """Coerce a report dict into typed rows, tolerating a few plausible shapes."""
     rows: list[BacktestRowOut] = []
@@ -530,10 +611,26 @@ def get_backtest(
         )
 
     reported_from = report.get("from_year") or report.get("from")
+
+    # Optional pass-throughs for the reliability curve / honesty panel (spec §3.7,
+    # §5 view 4). All defaulted so an older artifact lacking them still serialises.
+    calibration = _parse_calibration(report.get("calibration"))
+
     return BacktestOut(
         from_year=from_year if from_year is not None else reported_from,
         results=rows,
         source=source,
+        calibration=calibration,
+        ece=_as_float(report.get("ece")),
+        xi_chosen=_as_float(report.get("xi_chosen")),
+        xi_half_life_days=_as_float(report.get("xi_half_life_days")),
+        caveat=report.get("caveat") if isinstance(report.get("caveat"), str) else None,
+        generated_from=(
+            report.get("generated_from")
+            if isinstance(report.get("generated_from"), str)
+            else None
+        ),
+        n_matches=_as_int(report.get("n_matches")),
     )
 
 
