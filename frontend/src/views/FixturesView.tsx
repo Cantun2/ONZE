@@ -50,9 +50,10 @@ export function FixturesView() {
     <div>
       <h1>Remaining matches</h1>
       <p className="subtitle">
-        One row per match. The 1N2 bar and qualification figures are full
-        probability distributions — they express uncertainty, not a called
-        result. Click a row for the full score matrix.
+        One row per match, led by the model favourite and its win/advance
+        probability. The 1N2 bar and projected (expected) goals are full
+        distributions — they express uncertainty, not a called result. The modal
+        score is shown as a secondary chip. Click a row for the full score matrix.
       </p>
 
       <div className="card" style={{ padding: 0, overflowX: "auto" }}>
@@ -74,9 +75,9 @@ export function FixturesView() {
                 Stage{arrow("stage")}
               </th>
               <th>Match</th>
-              <th>Most likely</th>
+              <th>Model favourite</th>
               <th>Outcome (1N2)</th>
-              <th>Qualification</th>
+              <th>Projection</th>
               <th>Read</th>
             </tr>
           </thead>
@@ -113,6 +114,29 @@ export function FixturesView() {
  */
 import { usePrediction } from "../api/queries";
 import { confidenceLabel, pct } from "../lib/format";
+import { expectedGoals, fmtGoals } from "../lib/matrix";
+
+/**
+ * Favourite = the side (or draw) with the highest outcome probability. For KO
+ * ties we prefer the advance probabilities, since "who goes through" is the
+ * headline; for the modal-draw case in regulation we fall back to 1N2.
+ */
+function favourite(
+  f: Fixture,
+  pred: NonNullable<ReturnType<typeof usePrediction>["data"]>,
+): { name: string; prob: number; kind: "advance" | "win" | "draw" } {
+  if (f.knockout && pred.advance) {
+    return pred.advance.p_home_advance >= pred.advance.p_away_advance
+      ? { name: f.home_team, prob: pred.advance.p_home_advance, kind: "advance" }
+      : { name: f.away_team, prob: pred.advance.p_away_advance, kind: "advance" };
+  }
+  const outcomes = [
+    { name: f.home_team, prob: pred.p_home, kind: "win" as const },
+    { name: "Draw (90')", prob: pred.p_draw, kind: "draw" as const },
+    { name: f.away_team, prob: pred.p_away, kind: "win" as const },
+  ];
+  return outcomes.reduce((a, b) => (b.prob > a.prob ? b : a));
+}
 
 function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
   const { data: pred } = usePrediction(f.fixture_id);
@@ -120,6 +144,8 @@ function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
   const conf = pred
     ? confidenceLabel(pred.p_home, pred.p_draw, pred.p_away)
     : null;
+  const fav = pred ? favourite(f, pred) : null;
+  const xg = pred ? expectedGoals(pred.matrix) : null;
 
   return (
     <tr
@@ -143,7 +169,24 @@ function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
         <span className="vs">vs</span>
         {f.away_team}
       </td>
-      <td className="mono">{pred ? pred.most_likely_score : "—"}</td>
+      <td>
+        {fav ? (
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 17 }} className="mono">
+              {pct(fav.prob)}
+            </div>
+            <div className="dim" style={{ fontSize: 12 }}>
+              {fav.kind === "advance"
+                ? `${fav.name} to advance`
+                : fav.kind === "draw"
+                  ? "level (draw most likely)"
+                  : `${fav.name} to win`}
+            </div>
+          </div>
+        ) : (
+          <span className="dim">—</span>
+        )}
+      </td>
       <td>
         {pred ? (
           <OneN2Bar pHome={pred.p_home} pDraw={pred.p_draw} pAway={pred.p_away} />
@@ -157,19 +200,29 @@ function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
           </div>
         )}
       </td>
-      <td className="mono">
-        {f.knockout ? (
-          pred?.advance ? (
-            <span title="Chance to advance (incl. extra time + penalties)">
-              {f.home_team.slice(0, 3).toUpperCase()} {pct(pred.advance.p_home_advance)}
-              {" · "}
-              {f.away_team.slice(0, 3).toUpperCase()} {pct(pred.advance.p_away_advance)}
+      <td>
+        {pred && xg ? (
+          <div>
+            <div
+              className="mono"
+              title="Expected goals (model): mean goals for each side, not a predicted actual score."
+            >
+              {fmtGoals(xg.xgHome)}{" "}
+              <span className="dim">–</span> {fmtGoals(xg.xgAway)}{" "}
+              <span className="dim" style={{ fontSize: 11 }}>
+                proj. xG
+              </span>
+            </div>
+            <span
+              className="tag"
+              style={{ marginTop: 4 }}
+              title="Single most likely exact scoreline (mode of the distribution)"
+            >
+              modal {pred.most_likely_score}
             </span>
-          ) : (
-            <span className="dim">—</span>
-          )
+          </div>
         ) : (
-          <span className="dim">group / n/a</span>
+          <span className="dim">—</span>
         )}
       </td>
       <td>

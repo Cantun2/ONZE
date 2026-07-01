@@ -5,6 +5,7 @@ import { ErrorState, Loading } from "../components/States";
 import { ScoreHeatmap } from "../components/ScoreHeatmap";
 import { OneN2Bar } from "../components/OneN2Bar";
 import { pct, pct1 } from "../lib/format";
+import { expectedGoals, fmtGoals } from "../lib/matrix";
 
 export function MatchDetailView() {
   const { fixtureId } = useParams();
@@ -31,6 +32,8 @@ export function MatchDetailView() {
         the only honest object. No outcome is certain.
       </p>
 
+      <SummaryStrip pred={data} />
+
       <div className="grid-2">
         <div className="card">
           <h2>Score probability matrix P(x, y)</h2>
@@ -44,6 +47,53 @@ export function MatchDetailView() {
         <div>
           <MarketsPanel pred={data} />
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * A compact headline strip: the projected (expected-goals) scoreline and the
+ * 1N2 distribution side by side. This foregrounds the signal — two evenly
+ * matched ties that both have a 1-1 mode still read differently here because
+ * their xG and win bars differ.
+ */
+function SummaryStrip({ pred }: { pred: Prediction }) {
+  const { xgHome, xgAway } = expectedGoals(pred.matrix);
+  return (
+    <div
+      className="card"
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 28,
+        alignItems: "center",
+        marginBottom: 18,
+      }}
+    >
+      <div>
+        <div className="dim" style={{ fontSize: 12 }}>
+          Projected scoreline · expected goals (model)
+        </div>
+        <div style={{ fontSize: 22, fontWeight: 700 }} className="mono">
+          {pred.home_team} {fmtGoals(xgHome)}{" "}
+          <span className="dim">–</span> {fmtGoals(xgAway)} {pred.away_team}
+        </div>
+        <div className="dim" style={{ fontSize: 11 }}>
+          mean goals per side — not a prediction of the actual score. Modal score{" "}
+          {pred.most_likely_score}.
+        </div>
+      </div>
+      <div style={{ minWidth: 240 }}>
+        <div className="dim" style={{ fontSize: 12, marginBottom: 6 }}>
+          Match result (90&apos;)
+        </div>
+        <OneN2Bar
+          pHome={pred.p_home}
+          pDraw={pred.p_draw}
+          pAway={pred.p_away}
+          showLegend
+        />
       </div>
     </div>
   );
