@@ -15,40 +15,40 @@ penalties (spec §3.5). We do **not** sample a raw scoreline and re-resolve it b
 hand: ``advance_prob`` is knockout-engineer's canonical resolver, so sampling its
 output is exactly consistent with the per-fixture qualification numbers
 ``fixture.py`` reports. This keeps one source of truth for "who goes through".
-(The alternative — sampling a scoreline from ``P`` then re-resolving ET/pens — has
-the same expectation but adds Monte-Carlo noise for no modelling gain, so we
-avoid it.)
 
-Bracket structure (the 8 illustrative 2026 fixtures)
----------------------------------------------------
-The seeded fixtures form a standard QF -> SF -> Final tree plus a third-place
-play-off. We encode the linkage explicitly in :data:`BRACKET` below. **Documented
-assumption:** the four quarter-finals feed the two semi-finals in fixture order —
-QF0 & QF1 winners meet in SF0, QF2 & QF3 winners meet in SF1 — and the two SF
-winners meet in the Final; the two SF losers meet in the third-place play-off.
-The seeded SF/Final rows name specific teams only illustratively (one possible
-outcome); the simulation replaces those with the actual simulated winners, so the
-seeded home/away teams of SF/Final rows are ignored for linkage — only their
-fixture ``date``, ``stage``, ``neutral`` and ``host_flag`` (venue/context) are
-used.
+Bracket structure (general single-elimination)
+----------------------------------------------
+The base round is read straight from the ``fixtures`` table, ordered by
+``(date, fixture_id)``. Its size must be a power of two (e.g. 8 Round-of-16 ties,
+or 4 quarter-finals). **Documented linkage assumption:** consecutive base
+fixtures feed the same next-round tie — winners of base ties ``2j`` and ``2j+1``
+meet in tie ``j`` of the following round — and this pairing repeats up the tree
+until one champion remains. This matches how a drawn bracket is laid out in
+fixture order.
+
+Venue/home-field: the base round uses each fixture's own ``neutral`` / ``host_flag``
+(so a host nation playing at home keeps its Elo bonus, spec §3.1/§7.3). Later
+rounds have unknown participants, so they are treated as **neutral** (no home
+bonus) — the honest default, since we cannot know in advance whether a host will
+reach them or where they will play.
 
 Reproducibility (definition of done)
 ------------------------------------
 The whole simulation is driven by a single seeded ``numpy.random.Generator``
 (``seed`` argument, default from a module constant), so results are bit-for-bit
-reproducible. Per-round reach-probabilities and champion probabilities are exact
-counts / ``n_sims``; champion probabilities over all teams sum to 1.
+reproducible. Reach/champion probabilities are exact counts / ``n_sims``;
+champion probabilities over all teams sum to 1, and the reach columns satisfy
+``P(champion) <= P(reach final) <= P(reach semi)``.
 
 Public API
 ----------
-``build_bracket``        assemble the bracket + per-tie advance probs from the DB.
+``base_pairs``           read the base-round pairings (+ venue) from the DB.
 ``simulate_tournament``  Monte-Carlo -> per-team P(reach round) & P(champion).
 ``main``                 ``python -m src.predict.bracket`` -> print the table.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
@@ -62,143 +62,55 @@ from src.ratings.elo import _home_bonus
 
 DEFAULT_SEED = 20260619  # World Cup 2026 final date, as a stable default seed.
 
+# Venue/context for rounds whose participants are not yet known: neutral ground.
+_NEUTRAL_VENUE = {"neutral": True, "host_flag": False}
 
-# ---------------------------------------------------------------------------
-# Bracket linkage for the seeded 2026 fixtures (documented in the module header)
-# ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class BracketNode:
-    """One tie in the bracket tree.
+# Number of base ties -> the label of the round those winners *enter* next.
+# Used only for the printed report; the reach columns are keyed off ties-left.
+_NEXT_ROUND = {8: "Quarter-final", 4: "Semi-final", 2: "Final", 1: "Champion"}
 
-    A node's two competitors are either concrete teams (quarter-finals, whose
-    participants are already known) or the *winner*/*loser* of earlier nodes.
-    ``feeds`` maps a slot ("home"/"away") to either ``("team", team_id)`` or
-    ``("winner", node_key)`` / ``("loser", node_key)``.
+
+def base_pairs(con) -> list[tuple[int, int, dict]]:
+    """Read the base-round pairings from ``fixtures`` in bracket order.
+
+    The base round is the **widest** round present in ``fixtures`` — the stage
+    with the most ties (e.g. the 8 Round-of-16 ties, or 4 quarter-finals). Any
+    later-round rows (semi-final / final / third-place) are ignored: their
+    participants are decided by the simulation, so only the base pairings and the
+    tree shape matter. This lets the sim run whether the seeded fixtures start at
+    the Round of 16 or at the quarter-finals.
+
+    Returns a list of ``(home_id, away_id, venue_row)`` tuples ordered by
+    ``(date, fixture_id)``; ``venue_row`` carries ``neutral`` / ``host_flag`` for
+    the effective home bonus. The number of pairings must be a power of two.
     """
-
-    key: str
-    round_name: str          # human round label ("Quarter-final", ...)
-    feeds: dict[str, tuple]  # "home"/"away" -> ("team", id) | ("winner"|"loser", key)
-
-
-# The remaining-round order a team can reach, coarsest last. Used to accumulate
-# "reached at least this round" counts. (A quarter-finalist has, by definition,
-# already reached the quarter-finals — that is the entry round of this bracket.)
-ROUND_ORDER = ["Quarter-final", "Semi-final", "Final", "Champion"]
-
-
-def build_bracket(
-    con,
-    model_version: str = "dc-v1",
-    cfg: Config | None = None,
-) -> tuple[dict[str, BracketNode], dict[str, float], dict[int, str]]:
-    """Assemble the bracket tree and each *quarter-final's* advance probability.
-
-    Returns ``(nodes, qf_p_home_advance, team_names)`` where:
-
-    * ``nodes`` maps node-key -> :class:`BracketNode` for QFs, SFs, the Final and
-      the third-place play-off, with the linkage described in the module header;
-    * ``qf_p_home_advance`` maps each QF node-key -> ``P(home side advances)``
-      from :func:`src.model.knockout.advance_prob` (the QF pairings are known, so
-      their advance probs are fixed up front). SF/Final/3rd-place advance probs
-      depend on who wins earlier rounds, so they are computed *inside* the
-      simulation per draw (see :func:`_advance_p_home`).
-    * ``team_names`` maps team_id -> canonical name.
-
-    Reads current Elo (``teams.elo_current``, honouring neutral/host_flag) and the
-    fitted coefficients; does not modify any upstream module.
-    """
-    if cfg is None:
-        cfg = load_config()
-
     fx = con.execute(
         "SELECT fixture_id, date, home_id, away_id, stage, neutral, host_flag "
         "FROM fixtures ORDER BY date, fixture_id"
     ).fetchdf()
+    if fx.empty:
+        raise ValueError("fixtures table is empty; nothing to simulate")
 
-    c0, c1, rho = load_coeffs(con, model_version)
+    # Widest round = base. Tie-break on the earliest date so the true entry round
+    # wins if two stages happen to have equal counts.
+    counts = fx.groupby("stage", sort=False)
+    base_stage = max(
+        counts.groups,
+        key=lambda s: (len(counts.groups[s]), -fx.loc[counts.groups[s], "date"].min().toordinal()),
+    )
+    base = fx[fx["stage"] == base_stage].sort_values(["date", "fixture_id"])
 
-    # Split by stage. The 4 quarter-finals (known pairings) drive the tree base.
-    qfs = fx[fx["stage"].str.lower() == "quarter-final"].reset_index(drop=True)
-    sfs = fx[fx["stage"].str.lower() == "semi-final"].reset_index(drop=True)
-    third = fx[fx["stage"].str.lower() == "third place"].reset_index(drop=True)
-    final = fx[fx["stage"].str.lower() == "final"].reset_index(drop=True)
-
-    if len(qfs) != 4:
-        raise ValueError(f"expected 4 quarter-finals, found {len(qfs)}")
-
-    nodes: dict[str, BracketNode] = {}
-    qf_p_home_advance: dict[str, float] = {}
-
-    # --- Quarter-finals: concrete pairings, fixed advance probs ---------------
-    for i, r in qfs.iterrows():
-        key = f"QF{i}"
-        home_id, away_id = int(r["home_id"]), int(r["away_id"])
-        nodes[key] = BracketNode(
-            key=key,
-            round_name="Quarter-final",
-            feeds={"home": ("team", home_id), "away": ("team", away_id)},
+    pairs = [
+        (int(r.home_id), int(r.away_id),
+         {"neutral": bool(r.neutral), "host_flag": bool(r.host_flag)})
+        for r in base.itertuples(index=False)
+    ]
+    n = len(pairs)
+    if n == 0 or (n & (n - 1)) != 0:
+        raise ValueError(
+            f"base round '{base_stage}' must have a power-of-two number of ties, found {n}"
         )
-        qf_p_home_advance[key] = _advance_p_home(
-            con, home_id, away_id, r, c0, c1, rho, cfg
-        )
-
-    # --- Semi-finals: winners of QF pairs, in fixture order (documented) -------
-    # SF0 = winner(QF0) vs winner(QF1); SF1 = winner(QF2) vs winner(QF3).
-    sf_venue = _venue_rows(sfs, 2)
-    nodes["SF0"] = BracketNode(
-        key="SF0", round_name="Semi-final",
-        feeds={"home": ("winner", "QF0"), "away": ("winner", "QF1")},
-    )
-    nodes["SF1"] = BracketNode(
-        key="SF1", round_name="Semi-final",
-        feeds={"home": ("winner", "QF2"), "away": ("winner", "QF3")},
-    )
-
-    # --- Final: winners of the two semi-finals --------------------------------
-    nodes["FINAL"] = BracketNode(
-        key="FINAL", round_name="Final",
-        feeds={"home": ("winner", "SF0"), "away": ("winner", "SF1")},
-    )
-
-    # --- Third place: losers of the two semi-finals (not a route to champion) --
-    nodes["THIRD"] = BracketNode(
-        key="THIRD", round_name="Third place",
-        feeds={"home": ("loser", "SF0"), "away": ("loser", "SF1")},
-    )
-
-    # Venue/context rows for the later nodes (team identities are ignored; only
-    # neutral/host_flag/date drive H_eff for those ties).
-    nodes_venue = {
-        "SF0": sf_venue[0], "SF1": sf_venue[1],
-        "FINAL": _venue_rows(final, 1)[0],
-        "THIRD": _venue_rows(third, 1)[0],
-    }
-
-    team_names = dict(con.execute("SELECT team_id, name_canonical FROM teams").fetchall())
-
-    # Stash coeffs + venue on a lightweight context the simulator reuses.
-    _BRACKET_CTX["coeffs"] = (c0, c1, rho)
-    _BRACKET_CTX["venue"] = nodes_venue
-    _BRACKET_CTX["cfg"] = cfg
-
-    return nodes, qf_p_home_advance, team_names
-
-
-# Simulation context populated by build_bracket (coeffs + per-node venue rows).
-_BRACKET_CTX: dict[str, Any] = {}
-
-
-def _venue_rows(df: pd.DataFrame, n_expected: int) -> list[dict]:
-    """Return ``n_expected`` venue/context rows (neutral/host_flag/...) as dicts.
-
-    If the seeded set is short (illustrative fixtures), pad with a neutral World
-    Cup venue so the simulation still runs.
-    """
-    rows = df.to_dict("records")
-    while len(rows) < n_expected:
-        rows.append({"neutral": True, "host_flag": False})
-    return rows[:n_expected]
+    return pairs
 
 
 def _advance_p_home(
@@ -207,8 +119,7 @@ def _advance_p_home(
     """``P(home side advances)`` for a tie between ``home_id`` and ``away_id``.
 
     Wraps the full KO chain: current Elo -> lambdas -> advance_prob (spec §3.5).
-    ``venue_row`` supplies ``neutral`` / ``host_flag`` for the effective home
-    bonus (a mapping or a namedtuple-like row).
+    ``venue_row`` supplies ``neutral`` / ``host_flag`` for the effective home bonus.
     """
     neutral = bool(_get(venue_row, "neutral", True))
     host_flag = bool(_get(venue_row, "host_flag", False))
@@ -248,8 +159,7 @@ def simulate_tournament(
     ----------
     remaining_fixtures
         Ignored when reading straight from the DB (the bracket is built from the
-        ``fixtures`` table). Accepted for API compatibility with the spec
-        signature; pass ``None`` to use the seeded fixtures.
+        ``fixtures`` table). Accepted for API compatibility with the spec signature.
     model
         ``model_version`` of the fitted coefficients to use.
     n_sims, seed
@@ -260,15 +170,15 @@ def simulate_tournament(
     Returns
     -------
     pandas.DataFrame
-        One row per team that is in the remaining bracket, columns:
-        ``team_id, team, p_reach_semi, p_reach_final, p_champion``. (A
-        quarter-finalist has already reached the quarter-finals, so that column
-        is trivially 1 and omitted; the interesting remaining rounds are semi,
-        final and champion — spec §1/§5.) Sorted by ``p_champion`` descending.
+        One row per team in the remaining bracket, columns ``team_id, team,
+        p_reach_semi, p_reach_final, p_champion`` — the probability of reaching the
+        semi-final, the final, and of winning it. Sorted by ``p_champion`` desc.
 
     Every value is a Monte-Carlo estimate = count / ``n_sims``. Champion
-    probabilities over all teams sum to 1 (exactly one champion per sim); reach
-    probabilities are monotone (champion <= reach_final <= reach_semi).
+    probabilities over all teams sum to 1; reach probabilities are monotone
+    (champion <= reach_final <= reach_semi). ``reach_semi`` sums to 4 (four
+    semi-finalists), ``reach_final`` to 2 — independent of how deep the base round
+    is (Round of 16 or quarter-finals).
     """
     if cfg is None:
         cfg = load_config()
@@ -281,68 +191,58 @@ def simulate_tournament(
         own_con = True
 
     try:
-        nodes, qf_p_home, team_names = build_bracket(con, model, cfg)
-        c0, c1, rho = _BRACKET_CTX["coeffs"]
-        venue = _BRACKET_CTX["venue"]
+        pairs = base_pairs(con)
+        c0, c1, rho = load_coeffs(con, model)
+        team_names = dict(con.execute("SELECT team_id, name_canonical FROM teams").fetchall())
 
-        # Teams entering the bracket (the 8 quarter-finalists).
-        qf_teams: list[int] = []
-        for k in ("QF0", "QF1", "QF2", "QF3"):
-            qf_teams.append(nodes[k].feeds["home"][1])
-            qf_teams.append(nodes[k].feeds["away"][1])
+        all_teams = sorted({t for h, a, _ in pairs for t in (h, a)})
+        reach_semi = {t: 0 for t in all_teams}
+        reach_final = {t: 0 for t in all_teams}
+        champion = {t: 0 for t in all_teams}
 
         rng = np.random.default_rng(seed)
 
-        # Vectorised draws for the four QFs up front (fixed advance probs).
-        qf_home_wins = {
-            k: rng.random(n_sims) < qf_p_home[k] for k in ("QF0", "QF1", "QF2", "QF3")
-        }
+        # Current round competitors as (n_sims,) arrays; base round is constant.
+        homes = [np.full(n_sims, h, dtype=np.int64) for h, a, _ in pairs]
+        aways = [np.full(n_sims, a, dtype=np.int64) for h, a, _ in pairs]
+        venues = [v for _, _, v in pairs]
+        is_base = True
 
-        # Counters: reached-semi / reached-final / champion, per team.
-        reach_semi = {t: 0 for t in qf_teams}
-        reach_final = {t: 0 for t in qf_teams}
-        champion = {t: 0 for t in qf_teams}
+        ties_left = len(pairs)
+        while ties_left >= 1:
+            # Tally teams that have *reached* this round (its entrants).
+            if ties_left == 2:  # this round is the semi-final
+                for i in range(2):
+                    _tally(reach_semi, homes[i]); _tally(reach_semi, aways[i])
+            if ties_left == 1:  # this round is the final
+                _tally(reach_final, homes[0]); _tally(reach_final, aways[0])
 
-        # Winners of each QF as team-id arrays over the n_sims draws.
-        def qf_winner(k: str) -> np.ndarray:
-            home = nodes[k].feeds["home"][1]
-            away = nodes[k].feeds["away"][1]
-            return np.where(qf_home_wins[k], home, away)
+            winners = []
+            for i in range(ties_left):
+                venue = venues[i] if is_base else _NEUTRAL_VENUE
+                hw = _sim_tie(con, homes[i], aways[i], venue, c0, c1, rho, cfg, rng)
+                winners.append(np.where(hw, homes[i], aways[i]))
 
-        qf0_w, qf1_w = qf_winner("QF0"), qf_winner("QF1")
-        qf2_w, qf3_w = qf_winner("QF2"), qf_winner("QF3")
+            if ties_left == 1:
+                _tally(champion, winners[0])
+                break
 
-        # SF0 = qf0_w vs qf1_w ; SF1 = qf2_w vs qf3_w. Both QF winners have
-        # reached the semi-finals.
-        for arr in (qf0_w, qf1_w, qf2_w, qf3_w):
-            _tally(reach_semi, arr)
+            # Pair adjacent winners into the next round (documented linkage).
+            homes = [winners[2 * j] for j in range(ties_left // 2)]
+            aways = [winners[2 * j + 1] for j in range(ties_left // 2)]
+            is_base = False
+            ties_left //= 2
 
-        sf0_home_wins = _sim_tie(con, qf0_w, qf1_w, venue["SF0"], c0, c1, rho, cfg, rng)
-        sf1_home_wins = _sim_tie(con, qf2_w, qf3_w, venue["SF1"], c0, c1, rho, cfg, rng)
-
-        sf0_w = np.where(sf0_home_wins, qf0_w, qf1_w)
-        sf1_w = np.where(sf1_home_wins, qf2_w, qf3_w)
-
-        # Both SF winners have reached the Final.
-        _tally(reach_final, sf0_w)
-        _tally(reach_final, sf1_w)
-
-        # Final: sf0_w vs sf1_w -> champion.
-        final_home_wins = _sim_tie(con, sf0_w, sf1_w, venue["FINAL"], c0, c1, rho, cfg, rng)
-        champ = np.where(final_home_wins, sf0_w, sf1_w)
-        _tally(champion, champ)
-
-        rows = []
-        for t in qf_teams:
-            rows.append(
-                {
-                    "team_id": t,
-                    "team": team_names.get(t, str(t)),
-                    "p_reach_semi": reach_semi[t] / n_sims,
-                    "p_reach_final": reach_final[t] / n_sims,
-                    "p_champion": champion[t] / n_sims,
-                }
-            )
+        rows = [
+            {
+                "team_id": t,
+                "team": team_names.get(t, str(t)),
+                "p_reach_semi": reach_semi[t] / n_sims,
+                "p_reach_final": reach_final[t] / n_sims,
+                "p_champion": champion[t] / n_sims,
+            }
+            for t in all_teams
+        ]
         df = pd.DataFrame(rows).sort_values("p_champion", ascending=False).reset_index(drop=True)
         df.attrs["n_sims"] = n_sims
         df.attrs["seed"] = seed
@@ -366,34 +266,26 @@ def _sim_tie(
     """Simulate a whole round of ties given the two competitor arrays.
 
     ``home_arr[i]`` vs ``away_arr[i]`` is the tie in simulation ``i``. The two
-    arrays vary across sims (they are earlier-round winners), so distinct
-    pairings appear. We compute ``P(home advances)`` **once per distinct pairing**
-    (via :func:`_advance_p_home`, the canonical KO resolver) and draw a Bernoulli
+    arrays vary across sims (they are earlier-round winners), so distinct pairings
+    appear. We compute ``P(home advances)`` **once per distinct pairing** (via
+    :func:`_advance_p_home`, the canonical KO resolver) and draw a Bernoulli
     winner. Returns a boolean array: ``True`` where the home side advanced.
     """
-    home_wins = np.empty(home_arr.shape[0], dtype=bool)
     u = rng.random(home_arr.shape[0])
-
-    # Cache advance probs per (home_id, away_id) pairing to avoid recomputation.
-    cache: dict[tuple[int, int], float] = {}
-    # Group identical pairings for a vectorised comparison.
     pair_keys = list(zip(home_arr.tolist(), away_arr.tolist()))
-    unique_pairs = set(pair_keys)
-    for (h, a) in unique_pairs:
-        if (h, a) not in cache:
-            cache[(h, a)] = _advance_p_home(con, int(h), int(a), venue_row, c0, c1, rho, cfg)
-
+    cache: dict[tuple[int, int], float] = {}
+    for (h, a) in set(pair_keys):
+        cache[(h, a)] = _advance_p_home(con, int(h), int(a), venue_row, c0, c1, rho, cfg)
     p_home = np.array([cache[(h, a)] for (h, a) in pair_keys])
-    home_wins = u < p_home
-    return home_wins
+    return u < p_home
 
 
 def main(argv=None) -> None:
     """Run the bracket simulation and print reach/champion probabilities.
 
-    ``python -m src.predict.bracket``. Uses the seeded 2026 fixtures, a fixed
-    seed (reproducible), and prints the per-team table plus the sanity totals
-    required by the definition of done (champion probs sum to 1).
+    ``python -m src.predict.bracket``. Uses the seeded fixtures, a fixed seed
+    (reproducible), and prints the per-team table plus the sanity totals required
+    by the definition of done (champion probs sum to 1).
     """
     cfg = load_config()
     df = simulate_tournament(n_sims=100_000, seed=DEFAULT_SEED, cfg=cfg)
@@ -402,13 +294,10 @@ def main(argv=None) -> None:
           f"(n_sims={df.attrs['n_sims']:,}, seed={df.attrs['seed']}):\n")
     print(df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
-    p_champ_sum = df["p_champion"].sum()
-    p_final_sum = df["p_reach_final"].sum()
-    p_semi_sum = df["p_reach_semi"].sum()
     print("\n[bracket] sanity totals (definition of done):")
-    print(f"  sum P(champion)     = {p_champ_sum:.6f}   (must be ~1: one champion)")
-    print(f"  sum P(reach final)  = {p_semi_sum and p_final_sum:.6f}   (must be ~2: two finalists)")
-    print(f"  sum P(reach semi)   = {p_semi_sum:.6f}   (must be ~4: four semi-finalists)")
+    print(f"  sum P(champion)     = {df['p_champion'].sum():.6f}   (must be ~1: one champion)")
+    print(f"  sum P(reach final)  = {df['p_reach_final'].sum():.6f}   (must be ~2: two finalists)")
+    print(f"  sum P(reach semi)   = {df['p_reach_semi'].sum():.6f}   (must be ~4: four semi-finalists)")
 
 
 if __name__ == "__main__":  # pragma: no cover
