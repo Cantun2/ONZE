@@ -1,0 +1,31 @@
+# ONZE local stack: FastAPI backend + Vite frontend.
+# Secrets are passed via env only (see .env / .env.example) — none in the repo.
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: onze-backend
+    ports:
+      - "8000:8000"
+    environment:
+      # Read from the shell / .env; never hard-coded here.
+      ONZE_ODDS_API_KEY: ${ONZE_ODDS_API_KEY:-}
+    volumes:
+      # Persist processed data + DB across restarts (spec §2.2).
+      - ./data:/app/data
+    command: uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: onze-frontend
+    ports:
+      - "5173:5173"
+    environment:
+      # Where the browser reaches the API.
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8000}
+    depends_on:
+      - backend
