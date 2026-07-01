@@ -17,6 +17,10 @@ statsmodels==0.14.4
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
 
+# --- eval / plotting ---
+matplotlib==3.10.0
+
 # --- tests ---
 pytest==8.3.4
 hypothesis==6.122.3
+httpx==0.28.1  # required by FastAPI TestClient in tests/test_api.py
