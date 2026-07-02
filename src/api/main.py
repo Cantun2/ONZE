@@ -38,6 +38,7 @@ CORS is enabled for the Vite dev frontend; origins are configurable via the
 
 from __future__ import annotations
 
+import datetime as _dt
 import json
 import os
 from pathlib import Path
@@ -48,8 +49,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from src.config import load_config
-from src.predict.fixture import is_knockout_stage
+from src.predict.bracket import played_result
+from src.predict.fixture import is_knockout_stage, news_delta
 from src.predict.markets import derive_markets
+
+# Window (days) used to match an already-played ``matches`` row to a knockout
+# fixture's scheduled date -- mirrors ``src.predict.bracket._PLAYED_MATCH_WINDOW_DAYS``
+# so the goals we surface in ``/fixtures`` agree with the winner
+# ``played_result`` resolves (same tie, not an earlier meeting between the pair).
+_PLAYED_MATCH_WINDOW_DAYS = 3
 
 MODEL_VERSION = "dc-v1"
 
@@ -61,6 +69,23 @@ _EVAL_REPORT_CANDIDATES = ("backtest_report.json", "backtest.json", "report.json
 # ---------------------------------------------------------------------------
 # Pydantic response models (typed + documented -> OpenAPI, spec DoD)
 # ---------------------------------------------------------------------------
+class ResultOut(BaseModel):
+    """Actual result of an already-played knockout tie (spec §4.4 /fixtures).
+
+    Goals are oriented to the *fixture's* home/away (not necessarily the
+    ``matches`` row's own orientation, which can differ, e.g. neutral-venue
+    ties recorded with the other team as "home").
+    """
+
+    home_goals: int
+    away_goals: int
+    winner_id: int
+    winner_team: str
+    shootout: bool = Field(
+        ..., description="True when the 90'/ET score was level and the winner came from penalties."
+    )
+
+
 class FixtureOut(BaseModel):
     """One remaining match with metadata and joined team names (spec §4.4 /fixtures)."""
 
@@ -74,6 +99,12 @@ class FixtureOut(BaseModel):
     neutral: bool
     host_flag: bool
     knockout: bool = Field(..., description="True if this is a knockout tie (spec §3.5).")
+    played: bool = Field(
+        False, description="True if this tie already has a completed result in `matches`."
+    )
+    result: Optional[ResultOut] = Field(
+        None, description="Actual result when `played` is true; null otherwise."
+    )
 
 
 class OverUnderLine(BaseModel):
@@ -98,6 +129,20 @@ class AdvanceOut(BaseModel):
     p_away_advance: float
 
 
+class NewsSideOut(BaseModel):
+    """One team's live news-adjustment overlay (subjective, prediction-time only)."""
+
+    delta: float = Field(0.0, description="Elo delta applied at prediction time (0 if none).")
+    note: Optional[str] = Field(None, description="Human-readable reason, e.g. an injury note.")
+
+
+class NewsAdjustmentOut(BaseModel):
+    """Home/away news overlay for a fixture (spec: never touches stored ratings)."""
+
+    home: NewsSideOut
+    away: NewsSideOut
+
+
 class PredictionOut(BaseModel):
     """Full P(x,y) matrix + derived markets for one fixture (spec §4.4 /predict)."""
 
@@ -119,6 +164,13 @@ class PredictionOut(BaseModel):
     btts: float
     advance: Optional[AdvanceOut] = Field(
         None, description="Present only for knockout fixtures (spec §3.5)."
+    )
+    news_adjustment: Optional[NewsAdjustmentOut] = Field(
+        None,
+        description=(
+            "Live per-team Elo overlay from config.yaml news_adjustments "
+            "(injury/suspension nudges), applied at prediction time only."
+        ),
     )
 
 
@@ -243,6 +295,81 @@ def _advance_for(fixture_id: int, stage: Optional[str]) -> Optional[dict[str, fl
     return adv or None
 
 
+def _fixture_result(con, home_id: int, away_id: int, date: Any) -> Optional[dict[str, Any]]:
+    """Actual result for an already-played knockout tie, or ``None`` if unplayed.
+
+    Thin read: :func:`src.predict.bracket.played_result` resolves the winner
+    (handling shootouts via the historical record); one extra indexed query on
+    ``matches`` fetches the 90'/ET goals for the same windowed pair so the
+    scoreline and the winner stay consistent. No modelling logic here.
+    """
+    fx_date: Optional[_dt.date] = None
+    if isinstance(date, _dt.datetime):
+        fx_date = date.date()
+    elif isinstance(date, _dt.date):
+        fx_date = date
+    elif date is not None:
+        try:
+            fx_date = _dt.date.fromisoformat(str(date)[:10])
+        except ValueError:
+            fx_date = None
+
+    winner_id = played_result(con, home_id, away_id, fx_date)
+    if winner_id is None:
+        return None
+
+    try:
+        if fx_date is not None:
+            lo = fx_date - _dt.timedelta(days=_PLAYED_MATCH_WINDOW_DAYS)
+            hi = fx_date + _dt.timedelta(days=_PLAYED_MATCH_WINDOW_DAYS)
+            row = con.execute(
+                """
+                SELECT home_id, away_id, home_goals, away_goals
+                FROM matches
+                WHERE ((home_id = ? AND away_id = ?) OR (home_id = ? AND away_id = ?))
+                  AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+                  AND date BETWEEN ? AND ?
+                ORDER BY date DESC LIMIT 1
+                """,
+                [home_id, away_id, away_id, home_id, lo, hi],
+            ).fetchone()
+        else:
+            row = con.execute(
+                """
+                SELECT home_id, away_id, home_goals, away_goals
+                FROM matches
+                WHERE ((home_id = ? AND away_id = ?) OR (home_id = ? AND away_id = ?))
+                  AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+                ORDER BY date DESC LIMIT 1
+                """,
+                [home_id, away_id, away_id, home_id],
+            ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+
+    m_home, m_away, hg, ag = row
+    # Orient goals to the *fixture's* home/away, not the matches row's own.
+    if int(m_home) == int(home_id):
+        home_goals, away_goals = int(hg), int(ag)
+    else:
+        home_goals, away_goals = int(ag), int(hg)
+
+    winner_row = con.execute(
+        "SELECT name_canonical FROM teams WHERE team_id = ?", [int(winner_id)]
+    ).fetchone()
+    winner_team = winner_row[0] if winner_row else str(winner_id)
+
+    return {
+        "home_goals": home_goals,
+        "away_goals": away_goals,
+        "winner_id": int(winner_id),
+        "winner_team": winner_team,
+        "shootout": bool(hg == ag),
+    }
+
+
 # ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
@@ -313,26 +440,30 @@ def get_fixtures() -> list[FixtureOut]:
             ORDER BY f.date, f.fixture_id
             """
         ).fetchall()
+
+        out: list[FixtureOut] = []
+        for r in rows:
+            (fid, date, home_id, away_id, stage, neutral, host_flag, home_team, away_team) = r
+            # Single indexed lookup per fixture (16 rows) -- thin read, no compute.
+            result = _fixture_result(con, int(home_id), int(away_id), date)
+            out.append(
+                FixtureOut(
+                    fixture_id=int(fid),
+                    date=str(date) if date is not None else None,
+                    home_id=int(home_id),
+                    away_id=int(away_id),
+                    home_team=home_team or str(home_id),
+                    away_team=away_team or str(away_id),
+                    stage=stage,
+                    neutral=bool(neutral),
+                    host_flag=bool(host_flag),
+                    knockout=is_knockout_stage(stage),
+                    played=result is not None,
+                    result=ResultOut(**result) if result is not None else None,
+                )
+            )
     finally:
         con.close()
-
-    out: list[FixtureOut] = []
-    for r in rows:
-        (fid, date, home_id, away_id, stage, neutral, host_flag, home_team, away_team) = r
-        out.append(
-            FixtureOut(
-                fixture_id=int(fid),
-                date=str(date) if date is not None else None,
-                home_id=int(home_id),
-                away_id=int(away_id),
-                home_team=home_team or str(home_id),
-                away_team=away_team or str(away_id),
-                stage=stage,
-                neutral=bool(neutral),
-                host_flag=bool(host_flag),
-                knockout=is_knockout_stage(stage),
-            )
-        )
     return out
 
 
@@ -349,7 +480,7 @@ def get_prediction(fixture_id: int) -> PredictionOut:
     try:
         row = con.execute(
             """
-            SELECT p.matrix_json, p.model_version, f.stage,
+            SELECT p.matrix_json, p.model_version, f.stage, f.home_id, f.away_id,
                    th.name_canonical AS home_team,
                    ta.name_canonical AS away_team
             FROM predictions p
@@ -379,7 +510,7 @@ def get_prediction(fixture_id: int) -> PredictionOut:
             ),
         )
 
-    matrix_json, model_version, stage, home_team, away_team = row
+    matrix_json, model_version, stage, home_id, away_id, home_team, away_team = row
     matrix = _matrix_from_json(matrix_json)
 
     # Derived markets are pure sums over the stored matrix (spec §3.4) — light.
@@ -404,6 +535,16 @@ def get_prediction(fixture_id: int) -> PredictionOut:
         else None
     )
 
+    # Live news overlay (spec: prediction-time only, never persisted). Cheap
+    # config lookup per side -- no full predict_fixture recompute in the GET path.
+    cfg = load_config()
+    home_delta, home_note = news_delta(int(home_id), cfg)
+    away_delta, away_note = news_delta(int(away_id), cfg)
+    news_adjustment = NewsAdjustmentOut(
+        home=NewsSideOut(delta=float(home_delta), note=home_note if home_delta else None),
+        away=NewsSideOut(delta=float(away_delta), note=away_note if away_delta else None),
+    )
+
     return PredictionOut(
         fixture_id=int(fixture_id),
         model_version=model_version,
@@ -420,6 +561,7 @@ def get_prediction(fixture_id: int) -> PredictionOut:
         over_under=over_under,
         btts=float(markets["btts"]),
         advance=advance,
+        news_adjustment=news_adjustment,
     )
 
 

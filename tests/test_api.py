@@ -57,10 +57,34 @@ def test_fixtures_endpoint():
     fixtures = r.json()
     assert isinstance(fixtures, list) and len(fixtures) > 0
     fx = fixtures[0]
-    for key in ("fixture_id", "home_team", "away_team", "stage", "neutral", "knockout"):
+    for key in ("fixture_id", "home_team", "away_team", "stage", "neutral", "knockout", "played", "result"):
         assert key in fx
     # team names must be joined (not bare ids)
     assert isinstance(fx["home_team"], str)
+
+
+@requires_db
+def test_fixtures_endpoint_surfaces_played_result():
+    """Already-decided knockout ties expose the actual result (not just the model)."""
+    fixtures = client.get("/fixtures").json()
+    played = [f for f in fixtures if f["played"]]
+    unplayed = [f for f in fixtures if not f["played"]]
+    if not played:
+        pytest.skip("no already-played fixture in the seeded set")
+
+    fx = played[0]
+    assert fx["result"] is not None
+    result = fx["result"]
+    for key in ("home_goals", "away_goals", "winner_id", "winner_team", "shootout"):
+        assert key in result
+    assert isinstance(result["home_goals"], int) and result["home_goals"] >= 0
+    assert isinstance(result["away_goals"], int) and result["away_goals"] >= 0
+    assert result["winner_id"] in (fx["home_id"], fx["away_id"])
+    assert isinstance(result["winner_team"], str)
+    assert isinstance(result["shootout"], bool)
+
+    if unplayed:
+        assert unplayed[0]["result"] is None
 
 
 @requires_db
@@ -75,8 +99,16 @@ def test_predict_endpoint_and_matrix_roundtrip():
 
     # shape
     for key in ("matrix", "p_home", "p_draw", "p_away", "most_likely_score",
-                "top5_scores", "over_under", "btts"):
+                "top5_scores", "over_under", "btts", "news_adjustment"):
         assert key in body
+
+    # news_adjustment: per-side live Elo overlay (spec: prediction-time only)
+    news = body["news_adjustment"]
+    assert news is not None
+    for side in ("home", "away"):
+        assert side in news
+        assert "delta" in news[side] and "note" in news[side]
+        assert isinstance(news[side]["delta"], (int, float))
 
     matrix = body["matrix"]
     assert isinstance(matrix, list) and len(matrix) == len(matrix[0])  # square
