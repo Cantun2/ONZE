@@ -1,0 +1,58 @@
+# ONZE — central configuration
+# ---------------------------------------------------------------------------
+# Single source of truth for every model constant and path. No magic numbers
+# in code: every module imports these via src.config.load_config().
+# References are to ONZE_spec.md sections.
+# ---------------------------------------------------------------------------
+
+# --- Elo ratings (spec §3.1) ------------------------------------------------
+# K = importance weight of a match when updating Elo. Stored per match in
+# matches.importance_k, but these defaults drive ingestion tagging.
+k_by_tournament:
+  friendly: 10            # amical
+  qualifier: 25           # qualification (continental / world cup)
+  world_cup_finals: 60    # phase finale de Coupe du Monde
+  default: 20             # fallback for unclassified tournaments
+
+# Home-field advantage in Elo points (spec §3.1). H = 0 on neutral ground,
+# but kept > 0 for 2026 hosts (USA / Canada / Mexico) via host_flag.
+H: 100
+
+base_rating: 1500         # starting Elo for a team with no history
+
+# --- Goal model (spec §3.2, §3.3) ------------------------------------------
+# xi = time-decay rate applied per DAY to each historical observation:
+#   phi(dt) = exp(-xi * dt), dt in days.
+# A ~2-year half-life is the spec's starting point for international football.
+# Per-day rate for a half-life of 730 days: ln(2) / 730 = 0.0009495... .
+# Tune by backtest RPS (spec §7.4); this is only the initial value.
+xi: 0.0009495166856985552   # ln(2) / 730  (half-life ~= 2 years, in days)
+xi_half_life_days: 730       # documented half-life the xi above encodes
+
+# --- Score matrix truncation (spec §1, §3.3) -------------------------------
+K_max: 10                 # truncate P(x,y) to x,y in {0..K_max}, then renormalize
+
+# --- Knockout phase (spec §3.5) --------------------------------------------
+kappa: 0.8                # extra-time prudence factor on lambda (30/90 * kappa)
+theta: 0.0               # penalty-shootout sensitivity to Elo diff (0 = fair coin)
+
+# --- Player-news Elo overlay (SUBJECTIVE — not part of the calibrated model) -
+# A manual, judgement-based Elo delta added to a team's elo_current at PREDICTION
+# time only (it never touches the stored ratings or the fitted coefficients).
+# It encodes current injury/suspension news the team-level Elo model cannot see
+# (spec §3.1 uses no player data). Keep deltas modest and always documented with
+# a note + source; the UI shows them separately from the model output so the
+# distinction stays honest. Edit freely as news changes. Keyed by canonical team
+# name; teams absent here get delta 0.
+# Sources: ESPN / Yahoo / FourFourTwo WC2026 injury & suspension trackers,
+# as of 2026-07-02.
+news_adjustments:
+  Brazil:    {delta: -35, note: "Rodrygo out (ruptured ACL); Militao, Estevao, Wesley also absent"}
+  Spain:     {delta: -12, note: "Fermin Lopez out (metatarsal surgery)"}
+  Argentina: {delta: -8,  note: "Balerdi (calf) and Panichelli (ACL) out - squad depth only"}
+
+# --- Storage paths (relative to repo root) ---------------------------------
+paths:
+  raw_dir: data/raw            # datasets téléchargés bruts
+  processed_dir: data/processed # parquet nettoyés + table canonique noms
+  db_path: data/processed/onze.duckdb  # DuckDB/SQLite store (spec §2.2)
