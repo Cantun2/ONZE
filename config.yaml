@@ -36,6 +36,21 @@ K_max: 10                 # truncate P(x,y) to x,y in {0..K_max}, then renormali
 kappa: 0.8                # extra-time prudence factor on lambda (30/90 * kappa)
 theta: 0.0               # penalty-shootout sensitivity to Elo diff (0 = fair coin)
 
+# --- Player-news Elo overlay (SUBJECTIVE — not part of the calibrated model) -
+# A manual, judgement-based Elo delta added to a team's elo_current at PREDICTION
+# time only (it never touches the stored ratings or the fitted coefficients).
+# It encodes current injury/suspension news the team-level Elo model cannot see
+# (spec §3.1 uses no player data). Keep deltas modest and always documented with
+# a note + source; the UI shows them separately from the model output so the
+# distinction stays honest. Edit freely as news changes. Keyed by canonical team
+# name; teams absent here get delta 0.
+# Sources: ESPN / Yahoo / FourFourTwo WC2026 injury & suspension trackers,
+# as of 2026-07-02.
+news_adjustments:
+  Brazil:    {delta: -35, note: "Rodrygo out (ruptured ACL); Militao, Estevao, Wesley also absent"}
+  Spain:     {delta: -12, note: "Fermin Lopez out (metatarsal surgery)"}
+  Argentina: {delta: -8,  note: "Balerdi (calf) and Panichelli (ACL) out - squad depth only"}
+
 # --- Storage paths (relative to repo root) ---------------------------------
 paths:
   raw_dir: data/raw            # datasets téléchargés bruts

@@ -32,6 +32,28 @@ rounds have unknown participants, so they are treated as **neutral** (no home
 bonus) — the honest default, since we cannot know in advance whether a host will
 reach them or where they will play.
 
+Already-played base ties resolve to reality, not the model (correctness)
+--------------------------------------------------------------------------
+A live tournament has base ties that have already been played by the time we
+simulate. For each base tie we check ``matches`` (:func:`played_result`) for a
+completed result on that exact team pair around the fixture's date; if found,
+``p(actual winner advances) = 1.0`` deterministically (a level score is resolved
+via the historical shootout record, spec: martj42 shootouts CSV) and the model
+is skipped entirely for that tie. Unplayed base ties, and every later round
+(whose participants are not fixed yet), stay fully probabilistic via
+``advance_prob``. This keeps the simulated bracket tree consistent with reality
+as the tournament progresses (e.g. Morocco, not Netherlands, feeds the next
+round once that shootout has actually happened).
+
+Live news overlay (subjective, documented, prediction-time only)
+--------------------------------------------------------------------------
+``_advance_p_home`` uses :func:`src.predict.fixture.effective_elo` (current Elo
++ the ``config.yaml`` ``news_adjustments`` delta) rather than raw
+``teams.elo_current`` — the same overlay ``fixture.py`` applies to single-match
+predictions. It is a manual, documented nudge (e.g. a season-ending injury)
+applied only where a current Elo feeds a *live* prediction; it never touches
+stored ratings, the fitted goals-model coefficients, or eval/backtest.
+
 Reproducibility (definition of done)
 ------------------------------------
 The whole simulation is driven by a single seeded ``numpy.random.Generator``
@@ -42,25 +64,36 @@ champion probabilities over all teams sum to 1, and the reach columns satisfy
 
 Public API
 ----------
-``base_pairs``           read the base-round pairings (+ venue) from the DB.
+``base_pairs``           read the base-round pairings (+ venue/date) from the DB.
+``played_result``        actual winner of an already-played base tie, or None.
 ``simulate_tournament``  Monte-Carlo -> per-team P(reach round) & P(champion).
 ``main``                 ``python -m src.predict.bracket`` -> print the table.
 """
 
 from __future__ import annotations
 
+import csv
+import datetime as _dt
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
 
 from src.config import Config, load_config
+from src.ingest.canonical import resolve as _resolve_name
 from src.model.knockout import advance_prob
 from src.model.lambdas import predict_lambdas
-from src.predict.fixture import _team_elo, load_coeffs
+from src.predict.fixture import effective_elo, load_coeffs
 from src.ratings.elo import _home_bonus
 
 DEFAULT_SEED = 20260619  # World Cup 2026 final date, as a stable default seed.
+
+# A played tie's completed-match row must fall within this many days of the
+# fixture's scheduled date to be trusted as *this* KO leg (guards against the
+# same two teams having already met earlier in the tournament, e.g. group stage).
+_PLAYED_MATCH_WINDOW_DAYS = 3
 
 # Venue/context for rounds whose participants are not yet known: neutral ground.
 _NEUTRAL_VENUE = {"neutral": True, "host_flag": False}
@@ -82,7 +115,9 @@ def base_pairs(con) -> list[tuple[int, int, dict]]:
 
     Returns a list of ``(home_id, away_id, venue_row)`` tuples ordered by
     ``(date, fixture_id)``; ``venue_row`` carries ``neutral`` / ``host_flag`` for
-    the effective home bonus. The number of pairings must be a power of two.
+    the effective home bonus, plus ``date`` (the fixture's scheduled date) so the
+    base round can be checked against already-played results (see
+    :func:`played_result`). The number of pairings must be a power of two.
     """
     # Order by fixture_id: it *is* the bracket slot. (Ordering by date would
     # scramble adjacency when a round spans several days, e.g. the Round of 32.)
@@ -104,7 +139,8 @@ def base_pairs(con) -> list[tuple[int, int, dict]]:
 
     pairs = [
         (int(r.home_id), int(r.away_id),
-         {"neutral": bool(r.neutral), "host_flag": bool(r.host_flag)})
+         {"neutral": bool(r.neutral), "host_flag": bool(r.host_flag),
+          "date": pd.Timestamp(r.date).date()})
         for r in base.itertuples(index=False)
     ]
     n = len(pairs)
@@ -120,15 +156,18 @@ def _advance_p_home(
 ) -> float:
     """``P(home side advances)`` for a tie between ``home_id`` and ``away_id``.
 
-    Wraps the full KO chain: current Elo -> lambdas -> advance_prob (spec §3.5).
-    ``venue_row`` supplies ``neutral`` / ``host_flag`` for the effective home bonus.
+    Wraps the full KO chain: effective (news-overlay) Elo -> lambdas ->
+    advance_prob (spec §3.5). ``venue_row`` supplies ``neutral`` / ``host_flag``
+    for the effective home bonus. Uses :func:`src.predict.fixture.effective_elo`
+    so the live news-adjustment overlay feeds the bracket sim exactly like it
+    feeds ``predict_fixture`` — prediction-time only, never touching stored ratings.
     """
     neutral = bool(_get(venue_row, "neutral", True))
     host_flag = bool(_get(venue_row, "host_flag", False))
     h_eff = _home_bonus(neutral, host_flag, cfg.H)
 
-    elo_home = _team_elo(con, home_id)
-    elo_away = _team_elo(con, away_id)
+    elo_home = effective_elo(con, home_id, cfg)
+    elo_away = effective_elo(con, away_id, cfg)
     lam, mu = predict_lambdas(elo_home, elo_away, h_eff, c0, c1)
     adv = advance_prob(
         lam, mu, rho, elo_home, elo_away,
@@ -142,6 +181,108 @@ def _get(row, key, default):
     if isinstance(row, dict):
         return row.get(key, default)
     return getattr(row, key, default)
+
+
+# ---------------------------------------------------------------------------
+# Already-played base ties resolve to reality, not to the model (correctness).
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=1)
+def _load_shootouts(path: str) -> tuple[dict, ...]:
+    """Read+cache the martj42 shootout CSV as a tuple of raw row-dicts."""
+    with open(path, newline="", encoding="utf-8") as fh:
+        return tuple(csv.DictReader(fh))
+
+
+def _shootout_winner(
+    home_id: int, away_id: int, date: _dt.date | None, cfg: Config | None = None
+) -> int | None:
+    """Resolve a level-scoreline KO tie via the historical shootout record.
+
+    Matches ``data/raw/martj42_shootouts.csv`` on the *unordered* team pair
+    (raw martj42 names resolved through :func:`src.ingest.canonical.resolve`),
+    picking the row closest in date to the KO tie. Returns ``None`` if no
+    shootout record is found for the pair (so callers can decide how to react).
+    """
+    if cfg is None:
+        cfg = load_config()
+    path = cfg.paths.raw_dir / "martj42_shootouts.csv"
+    if not path.exists():
+        return None
+    rows = _load_shootouts(str(path))
+
+    candidates = []
+    for r in rows:
+        h = _resolve_name(r["home_team"])
+        a = _resolve_name(r["away_team"])
+        if h is None or a is None or {h, a} != {home_id, away_id}:
+            continue
+        try:
+            r_date = _dt.date.fromisoformat(r["date"])
+        except ValueError:
+            continue
+        candidates.append((r_date, r))
+    if not candidates:
+        return None
+
+    if date is not None:
+        candidates.sort(key=lambda t: abs((t[0] - date).days))
+    else:
+        candidates.sort(key=lambda t: t[0], reverse=True)
+    _, row = candidates[0]
+    return _resolve_name(row["winner"])
+
+
+def played_result(
+    con, home_id: int, away_id: int, date: _dt.date | None = None
+) -> int | None:
+    """``team_id`` of the actual winner if this tie has already been played.
+
+    Looks up ``matches`` for a completed (non-null goals) row for the *unordered*
+    pair ``{home_id, away_id}``, restricted to within
+    :data:`_PLAYED_MATCH_WINDOW_DAYS` of ``date`` when given -- the same two
+    teams can in principle have already met earlier in the tournament (e.g. the
+    group stage), and we only want to resolve *this* KO leg. Higher score wins;
+    a level score (shootout) is resolved via :func:`_shootout_winner`.
+
+    Degrades to ``None`` -- meaning "treat it as unplayed, use the model" --
+    whenever there's nothing to resolve: no ``matches`` table (self-contained
+    test DBs), no matching row, or (defensively) any query error.
+    """
+    try:
+        if date is not None:
+            lo = date - _dt.timedelta(days=_PLAYED_MATCH_WINDOW_DAYS)
+            hi = date + _dt.timedelta(days=_PLAYED_MATCH_WINDOW_DAYS)
+            row = con.execute(
+                """
+                SELECT home_id, away_id, home_goals, away_goals, date
+                FROM matches
+                WHERE ((home_id = ? AND away_id = ?) OR (home_id = ? AND away_id = ?))
+                  AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+                  AND date BETWEEN ? AND ?
+                ORDER BY date DESC LIMIT 1
+                """,
+                [home_id, away_id, away_id, home_id, lo, hi],
+            ).fetchone()
+        else:
+            row = con.execute(
+                """
+                SELECT home_id, away_id, home_goals, away_goals, date
+                FROM matches
+                WHERE ((home_id = ? AND away_id = ?) OR (home_id = ? AND away_id = ?))
+                  AND home_goals IS NOT NULL AND away_goals IS NOT NULL
+                ORDER BY date DESC LIMIT 1
+                """,
+                [home_id, away_id, away_id, home_id],
+            ).fetchone()
+    except Exception:
+        return None
+    if row is None:
+        return None
+
+    m_home, m_away, hg, ag, m_date = row
+    if hg == ag:
+        return _shootout_winner(int(m_home), int(m_away), m_date)
+    return int(m_home) if hg > ag else int(m_away)
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +338,14 @@ def simulate_tournament(
         c0, c1, rho = load_coeffs(con, model)
         team_names = dict(con.execute("SELECT team_id, name_canonical FROM teams").fetchall())
 
+        # Base ties already decided in reality resolve to the actual winner
+        # (deterministic), not to the model -- see `played_result`. Unplayed base
+        # ties (and every later round, whose participants aren't fixed yet) stay
+        # fully probabilistic.
+        base_played = [
+            played_result(con, h, a, _get(v, "date", None)) for h, a, v in pairs
+        ]
+
         all_teams = sorted({t for h, a, _ in pairs for t in (h, a)})
         reach_semi = {t: 0 for t in all_teams}
         reach_final = {t: 0 for t in all_teams}
@@ -221,6 +370,11 @@ def simulate_tournament(
 
             winners = []
             for i in range(ties_left):
+                if is_base and base_played[i] is not None:
+                    # Already played (spec: correctness) -- deterministic winner,
+                    # p(actual winner advances) = 1.0, no model call.
+                    winners.append(np.full(n_sims, base_played[i], dtype=np.int64))
+                    continue
                 venue = venues[i] if is_base else _NEUTRAL_VENUE
                 hw = _sim_tie(con, homes[i], aways[i], venue, c0, c1, rho, cfg, rng)
                 winners.append(np.where(hw, homes[i], aways[i]))
@@ -248,6 +402,8 @@ def simulate_tournament(
         df = pd.DataFrame(rows).sort_values("p_champion", ascending=False).reset_index(drop=True)
         df.attrs["n_sims"] = n_sims
         df.attrs["seed"] = seed
+        df.attrs["n_base_ties"] = len(pairs)
+        df.attrs["n_played_base"] = sum(1 for w in base_played if w is not None)
         return df
     finally:
         if own_con:
@@ -293,7 +449,10 @@ def main(argv=None) -> None:
     df = simulate_tournament(n_sims=100_000, seed=DEFAULT_SEED, cfg=cfg)
 
     print(f"[bracket] Monte-Carlo tournament sim "
-          f"(n_sims={df.attrs['n_sims']:,}, seed={df.attrs['seed']}):\n")
+          f"(n_sims={df.attrs['n_sims']:,}, seed={df.attrs['seed']}):")
+    print(f"[bracket] {df.attrs.get('n_played_base', 0)}/{df.attrs.get('n_base_ties', 0)} "
+          f"base ties already played -> resolved to the actual winner "
+          f"(deterministic); the rest stay model-driven.\n")
     print(df.to_string(index=False, float_format=lambda v: f"{v:.4f}"))
 
     print("\n[bracket] sanity totals (definition of done):")

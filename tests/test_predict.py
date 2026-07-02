@@ -334,6 +334,138 @@ def test_bracket_sim_reproducible(bracket_db):
     assert not np.array_equal(a_sorted["p_champion"].to_numpy(), c_sorted["p_champion"].to_numpy())
 
 
+# ---------------------------------------------------------------------------
+# effective_elo() — the live news-adjustment overlay (prediction-time only)
+# ---------------------------------------------------------------------------
+def test_effective_elo_applies_delta_and_defaults_zero(bracket_db):
+    """`effective_elo` adds the configured delta and defaults to 0 when unset."""
+    import dataclasses
+
+    con = duckdb.connect(str(bracket_db))
+    try:
+        cfg = fixture_mod.load_config()
+        overlay_cfg = dataclasses.replace(
+            cfg,
+            raw={
+                **cfg.raw,
+                "news_adjustments": {
+                    "Brazil": {"delta": -35, "note": "key players out"},
+                },
+            },
+        )
+        base_brazil = fixture_mod._team_elo(con, 39)  # Brazil (bracket_db teams)
+        assert fixture_mod.effective_elo(con, 39, overlay_cfg) == pytest.approx(
+            base_brazil - 35
+        )
+        delta, note = fixture_mod.news_delta(39, overlay_cfg)
+        assert delta == pytest.approx(-35)
+        assert note == "key players out"
+
+        # A team with no entry in news_adjustments defaults to a 0 delta.
+        base_france = fixture_mod._team_elo(con, 102)  # France
+        assert fixture_mod.effective_elo(con, 102, overlay_cfg) == pytest.approx(
+            base_france
+        )
+        assert fixture_mod.news_delta(102, overlay_cfg) == (0.0, None)
+    finally:
+        con.close()
+
+
+def test_predict_fixture_surfaces_news_adjustment(bracket_db):
+    """`predict_fixture`'s lambdas use the overlay and it's surfaced honestly."""
+    import dataclasses
+
+    con = duckdb.connect(str(bracket_db))
+    try:
+        cfg = fixture_mod.load_config()
+        overlay_cfg = dataclasses.replace(
+            cfg,
+            raw={
+                **cfg.raw,
+                "news_adjustments": {"Brazil": {"delta": -35, "note": "injuries"}},
+            },
+        )
+        r = fixture_mod.predict_fixture(0, con=con, cfg=overlay_cfg)  # USA vs Brazil
+        base_brazil = fixture_mod._team_elo(con, 39)
+        # The lambda-feeding elo_away is the *effective* (overlay-adjusted) elo.
+        assert r["elo_away"] == pytest.approx(base_brazil - 35)
+        assert r["news_adjustment"]["away"] == {"delta": -35, "note": "injuries"}
+        # Home side (USA) has no news entry -> zero delta, no note.
+        assert r["news_adjustment"]["home"] == {"delta": 0.0, "note": None}
+    finally:
+        con.close()
+
+
+# ---------------------------------------------------------------------------
+# played_result() — deterministic resolution of already-played KO ties
+# ---------------------------------------------------------------------------
+def test_played_result_resolves_decisive_score(bracket_db):
+    """A completed match with a decisive score resolves to the higher scorer."""
+    con = duckdb.connect(str(bracket_db))
+    try:
+        con.execute(
+            "INSERT INTO matches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [900001, _dt.date(2026, 7, 11), 310, 39, 0, 2, True, "FIFA World Cup", 60.0],
+        )
+        winner = bracket_mod.played_result(con, 310, 39, _dt.date(2026, 7, 11))
+        assert winner == 39  # Brazil won 2-0
+        # Order-agnostic: querying with the pair flipped gives the same winner.
+        winner_flipped = bracket_mod.played_result(con, 39, 310, _dt.date(2026, 7, 11))
+        assert winner_flipped == 39
+    finally:
+        con.close()
+
+
+def test_played_result_resolves_shootout_from_csv(bracket_db):
+    """A level score resolves via the martj42 shootout record (documented data)."""
+    con = duckdb.connect(str(bracket_db))
+    try:
+        # Real 2026 shootout on record: Netherlands 1-1 Morocco, Morocco won on pens.
+        netherlands_id = 198  # already in bracket_db
+        morocco_id = 193
+        con.execute(
+            "INSERT INTO matches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [900002, _dt.date(2026, 6, 29), netherlands_id, morocco_id, 1, 1, True,
+             "FIFA World Cup", 60.0],
+        )
+        winner = bracket_mod.played_result(
+            con, netherlands_id, morocco_id, _dt.date(2026, 6, 29)
+        )
+        assert winner == morocco_id
+    finally:
+        con.close()
+
+
+def test_played_result_none_when_unplayed_or_no_matches_table(bracket_db):
+    """Unplayed ties, and self-contained DBs without matches rows, degrade to None."""
+    con = duckdb.connect(str(bracket_db))
+    try:
+        # bracket_db's matches table exists but is empty -> nothing to resolve.
+        assert bracket_mod.played_result(con, 310, 39, _dt.date(2026, 7, 11)) is None
+    finally:
+        con.close()
+
+
+def test_bracket_sim_uses_played_result_deterministically(bracket_db):
+    """A base tie with a recorded result always sends the actual winner through."""
+    con = duckdb.connect(str(bracket_db))
+    try:
+        # QF0 (fixture_id=0) is USA(310) vs Brazil(39) on 2026-07-11; force Brazil in.
+        con.execute(
+            "INSERT INTO matches VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [900003, _dt.date(2026, 7, 11), 310, 39, 0, 3, True, "FIFA World Cup", 60.0],
+        )
+        df = bracket_mod.simulate_tournament(n_sims=2_000, seed=42, con=con)
+        usa = df[df["team_id"] == 310].iloc[0]
+        brazil = df[df["team_id"] == 39].iloc[0]
+        # Brazil reaches the semi-final in every single simulation (deterministic QF).
+        assert brazil["p_reach_semi"] == pytest.approx(1.0)
+        # USA is eliminated in the QF in every simulation.
+        assert usa["p_reach_semi"] == pytest.approx(0.0)
+    finally:
+        con.close()
+
+
 def test_bracket_favourite_leads(bracket_db):
     """The strongest teams (France/Argentina, 2131) should top champion odds."""
     con = duckdb.connect(str(bracket_db))

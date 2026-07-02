@@ -40,6 +40,7 @@ from typing import Any
 import numpy as np
 
 from src.config import Config, load_config
+from src.ingest.canonical import canonical_name
 from src.model.dixon_coles import score_matrix
 from src.model.knockout import advance_prob
 from src.model.lambdas import predict_lambdas
@@ -111,6 +112,40 @@ def _team_elo(con, team_id: int) -> float:
     return float(row[0])
 
 
+def news_delta(team_id: int, cfg: Config) -> tuple[float, str | None]:
+    """Manual, **prediction-time-only** Elo delta for ``team_id`` from config.
+
+    Reads ``config.yaml``'s ``news_adjustments`` section (keyed by canonical
+    team name -> ``{delta, note}``), e.g. an injury/suspension nudge applied at
+    prediction time only (see module docstring / spec: this must never touch
+    ``ratings_history``, fitted coefficients, or eval/backtests — those stay
+    pure). Returns ``(delta, note)``, defaulting to ``(0.0, None)`` when the
+    team has no entry (or its ``team_id`` doesn't resolve to a canonical name).
+    """
+    adjustments = (cfg.raw or {}).get("news_adjustments") or {}
+    try:
+        name = canonical_name(int(team_id))
+    except KeyError:
+        return 0.0, None
+    entry = adjustments.get(name)
+    if not entry:
+        return 0.0, None
+    return float(entry.get("delta", 0) or 0), entry.get("note")
+
+
+def effective_elo(con, team_id: int, cfg: Config) -> float:
+    """``teams.elo_current`` plus the live news-adjustment overlay (delta only).
+
+    This is the Elo value that must feed every *live* prediction (fixture.py's
+    lambda inputs, bracket.py's ``_advance_p_home``) — it is a display/subjective
+    overlay, never persisted back to ``teams`` or ``ratings_history``, and never
+    used by the goals-model fit or eval/backtest paths (those must stay leak-free
+    and reproducible on the pure Elo history, spec cardinal rule #2).
+    """
+    delta, _ = news_delta(team_id, cfg)
+    return _team_elo(con, team_id) + delta
+
+
 def predict_fixture(
     fixture_id: int,
     con=None,
@@ -156,8 +191,12 @@ def predict_fixture(
         home_id, away_id = int(home_id), int(away_id)
 
         c0, c1, rho = load_coeffs(con, model_version)
-        elo_home = _team_elo(con, home_id)
-        elo_away = _team_elo(con, away_id)
+        # Effective (news-overlay-adjusted) Elo feeds every live prediction; the
+        # overlay is prediction-time-only (never persisted, never in eval/ratings).
+        elo_home = effective_elo(con, home_id, cfg)
+        elo_away = effective_elo(con, away_id, cfg)
+        home_delta, home_note = news_delta(home_id, cfg)
+        away_delta, away_note = news_delta(away_id, cfg)
 
         # Effective home bonus, identical rule to the Elo engine (spec §3.1/§7.3).
         h_eff = _home_bonus(bool(neutral), bool(host_flag), cfg.H)
@@ -184,6 +223,12 @@ def predict_fixture(
             "rho": rho,
             "matrix": P,
             **markets,
+            # Honest surfacing of the live news overlay (spec: prediction-time
+            # only; delta 0 is fine, note omitted when there's nothing to say).
+            "news_adjustment": {
+                "home": {"delta": home_delta, "note": home_note if home_delta else None},
+                "away": {"delta": away_delta, "note": away_note if away_delta else None},
+            },
         }
 
         # Knockout ties additionally carry qualification probabilities (spec §3.5).
