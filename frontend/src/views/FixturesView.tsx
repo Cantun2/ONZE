@@ -4,6 +4,7 @@ import { useFixtures } from "../api/queries";
 import type { Fixture } from "../api/types";
 import { ErrorState, Loading, EmptyState } from "../components/States";
 import { OneN2Bar } from "../components/OneN2Bar";
+import { NewsBadge } from "../components/NewsBadge";
 import { formatDate } from "../lib/format";
 
 type SortKey = "date" | "stage";
@@ -48,12 +49,15 @@ export function FixturesView() {
 
   return (
     <div>
-      <h1>Remaining matches</h1>
+      <h1>Matches</h1>
       <p className="subtitle">
-        One row per match, led by the model favourite and its win/advance
-        probability. The 1N2 bar and projected (expected) goals are full
-        distributions — they express uncertainty, not a called result. The modal
-        score is shown as a secondary chip. Click a row for the full score matrix.
+        One row per tie. Matches already played show the <strong>actual
+        result</strong> — a fact, marked <span className="tag final">final</span> —
+        with the model's pre-match view kept as a muted secondary line. Matches
+        still to play lead with the model favourite and its win/advance
+        probability: the 1N2 bar and projected (expected) goals are full
+        distributions — they express uncertainty, not a called result. Click a
+        row for the full score matrix.
       </p>
 
       <div className="card" style={{ padding: 0, overflowX: "auto" }}>
@@ -146,10 +150,14 @@ function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
     : null;
   const fav = pred ? favourite(f, pred) : null;
   const xg = pred ? expectedGoals(pred.matrix) : null;
+  const decided = Boolean(f.played && f.result);
+  const hasNews =
+    pred?.news_adjustment &&
+    (pred.news_adjustment.home.delta !== 0 || pred.news_adjustment.away.delta !== 0);
 
   return (
     <tr
-      className="row"
+      className={`row${decided ? " decided" : ""}`}
       tabIndex={0}
       onClick={onOpen}
       onKeyDown={(e) => {
@@ -162,14 +170,32 @@ function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
       <td className="mono">{formatDate(f.date)}</td>
       <td>
         {f.stage ?? "—"}{" "}
-        {f.knockout && <span className="tag ko">KO</span>}
+        {f.knockout && <span className="tag ko">KO</span>}{" "}
+        {decided && <span className="tag final">Final</span>}
       </td>
       <td className="matchup">
-        {f.home_team}
-        <span className="vs">vs</span>
-        {f.away_team}
+        {decided && f.result ? (
+          <DecidedMatchup f={f} result={f.result} />
+        ) : (
+          <>
+            {f.home_team}
+            <span className="vs">vs</span>
+            {f.away_team}
+          </>
+        )}
+        {hasNews && pred?.news_adjustment && (
+          <div style={{ marginTop: 4, display: "flex", gap: 4, flexWrap: "wrap" }}>
+            <NewsBadge side={pred.news_adjustment.home} />
+            <NewsBadge side={pred.news_adjustment.away} />
+          </div>
+        )}
       </td>
-      <td>
+      <td className={decided ? "pre-match" : undefined}>
+        {decided && (
+          <div className="dim" style={{ fontSize: 11, marginBottom: 2 }}>
+            model pre-match:
+          </div>
+        )}
         {fav ? (
           <div>
             <div style={{ fontWeight: 700, fontSize: 17 }} className="mono">
@@ -187,20 +213,25 @@ function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
           <span className="dim">—</span>
         )}
       </td>
-      <td>
+      <td className={decided ? "pre-match" : undefined}>
         {pred ? (
           <OneN2Bar pHome={pred.p_home} pDraw={pred.p_draw} pAway={pred.p_away} />
         ) : (
           <span className="dim">—</span>
         )}
-        {conf && (
+        {conf && !decided && (
           <div className={`conf ${conf.level}`} style={{ marginTop: 4 }}>
             <span className="dot" />
             {conf.label}
           </div>
         )}
       </td>
-      <td>
+      <td className={decided ? "pre-match" : undefined}>
+        {decided && (
+          <div className="dim" style={{ fontSize: 11, marginBottom: 2 }}>
+            model pre-match xG:
+          </div>
+        )}
         {pred && xg ? (
           <div>
             <div
@@ -226,8 +257,35 @@ function FixtureRow({ f, onOpen }: { f: Fixture; onOpen: () => void }) {
         )}
       </td>
       <td>
-        <span className="dim">open →</span>
+        <span className="dim">{decided ? "view →" : "open →"}</span>
       </td>
     </tr>
+  );
+}
+
+/** Actual result for a decided tie: winner bold, loser muted, score front and
+ * centre, with a small shootout badge when the 90'/ET score was level. */
+function DecidedMatchup({
+  f,
+  result,
+}: {
+  f: Fixture;
+  result: NonNullable<Fixture["result"]>;
+}) {
+  const homeWon = result.winner_id === f.home_id;
+  const awayWon = result.winner_id === f.away_id;
+  return (
+    <div className="result-line">
+      <span className={homeWon ? "winner" : "loser"}>{f.home_team}</span>{" "}
+      <span className="mono">
+        {result.home_goals}–{result.away_goals}
+      </span>{" "}
+      <span className={awayWon ? "winner" : "loser"}>{f.away_team}</span>{" "}
+      {result.shootout && (
+        <span className="tag pens" title="Decided on penalties after extra time">
+          pens
+        </span>
+      )}
+    </div>
   );
 }

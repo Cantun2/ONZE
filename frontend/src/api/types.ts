@@ -1,6 +1,14 @@
 // TypeScript types mirroring the ONZE FastAPI Pydantic response models
 // (src/api/main.py). Field names match the API exactly — do not rename.
 
+export interface FixtureResult {
+  home_goals: number;
+  away_goals: number;
+  winner_id: number;
+  winner_team: string;
+  shootout: boolean;
+}
+
 export interface Fixture {
   fixture_id: number;
   date: string | null;
@@ -12,6 +20,10 @@ export interface Fixture {
   neutral: boolean;
   host_flag: boolean;
   knockout: boolean;
+  // Present once the API surfaces played ties; guard for undefined on older
+  // artifacts/mocks as well as for null.
+  played?: boolean;
+  result?: FixtureResult | null;
 }
 
 export interface ScoreProb {
@@ -28,6 +40,16 @@ export interface OverUnderLine {
 export interface AdvanceProbs {
   p_home_advance: number;
   p_away_advance: number;
+}
+
+export interface NewsSide {
+  delta: number;
+  note: string | null;
+}
+
+export interface NewsAdjustment {
+  home: NewsSide;
+  away: NewsSide;
 }
 
 export interface Prediction {
@@ -48,6 +70,9 @@ export interface Prediction {
   over_under: Record<string, OverUnderLine>;
   btts: number;
   advance: AdvanceProbs | null;
+  // Subjective manual Elo overlay (injuries/suspensions), not part of the
+  // calibrated model. Optional/nullable — older artifacts may omit it.
+  news_adjustment?: NewsAdjustment | null;
 }
 
 export interface BracketTeam {

@@ -4,6 +4,7 @@ import type { Prediction } from "../api/types";
 import { ErrorState, Loading } from "../components/States";
 import { ScoreHeatmap } from "../components/ScoreHeatmap";
 import { OneN2Bar } from "../components/OneN2Bar";
+import { NewsBadge } from "../components/NewsBadge";
 import { pct, pct1 } from "../lib/format";
 import { expectedGoals, fmtGoals } from "../lib/matrix";
 
@@ -32,6 +33,8 @@ export function MatchDetailView() {
         the only honest object. No outcome is certain.
       </p>
 
+      <NewsOverlayNote pred={data} />
+
       <SummaryStrip pred={data} />
 
       <div className="grid-2">
@@ -47,6 +50,45 @@ export function MatchDetailView() {
         <div>
           <MarketsPanel pred={data} />
         </div>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * Surfaces the live per-team news-adjustment Elo overlay (injuries/
+ * suspensions, spec §5): a manual, subjective nudge applied at
+ * prediction-time only — never part of the calibrated model. Renders
+ * nothing when neither side has a nonzero delta, so it never implies an
+ * adjustment where none was made.
+ */
+function NewsOverlayNote({ pred }: { pred: Prediction }) {
+  const na = pred.news_adjustment;
+  if (!na) return null;
+  const hasNews = na.home.delta !== 0 || na.away.delta !== 0;
+  if (!hasNews) return null;
+  return (
+    <div className="card" style={{ marginBottom: 18 }}>
+      <div className="market-label" style={{ marginBottom: 8 }}>
+        Manual news overlay
+      </div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 8 }}>
+        <NewsBadge side={na.home} label={pred.home_team} />
+        <NewsBadge side={na.away} label={pred.away_team} />
+      </div>
+      {na.home.delta !== 0 && na.home.note && (
+        <div className="dim" style={{ fontSize: 12, marginBottom: 4 }}>
+          {pred.home_team}: {na.home.note}
+        </div>
+      )}
+      {na.away.delta !== 0 && na.away.note && (
+        <div className="dim" style={{ fontSize: 12, marginBottom: 4 }}>
+          {pred.away_team}: {na.away.note}
+        </div>
+      )}
+      <div className="caveat" role="note">
+        News adjustment is a manual, subjective Elo nudge for injuries/
+        suspensions — not part of the calibrated model.
       </div>
     </div>
   );

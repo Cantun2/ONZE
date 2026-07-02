@@ -12,6 +12,7 @@
   --good: #4fd18b;
   --warn: #f5c542;
   --bad: #ff6b6b;
+  --news: #d391ff;
   --radius: 10px;
   color-scheme: dark;
 }
@@ -194,6 +195,40 @@ table.fixtures tr.row:focus-visible {
 .tag.ko {
   color: var(--warn);
   border-color: #4a3f1c;
+}
+.tag.final {
+  color: var(--good);
+  border-color: #1c4a30;
+  text-transform: uppercase;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+.tag.pens {
+  color: var(--warn);
+  border-color: #4a3f1c;
+}
+.tag.news {
+  color: var(--news);
+  border-color: #4a2f5a;
+  cursor: help;
+}
+
+/* played/decided fixture rows: the result is fact, the model line is a muted
+   secondary reference (pre-match prior), not hidden. 0.8 opacity keeps
+   dim-on-dim text at/above 4.5:1 contrast against --bg-elev (WCAG AA). */
+.row.decided .pre-match {
+  opacity: 0.8;
+}
+.result-line {
+  font-weight: 700;
+  font-size: 15px;
+}
+.result-line .winner {
+  color: var(--text);
+}
+.result-line .loser {
+  color: var(--text-dim);
+  font-weight: 500;
 }
 
 /* stacked 1N2 bar */
